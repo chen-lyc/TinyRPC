@@ -41,7 +41,7 @@ ConnGuard RpcConnPool::getConnGuard(const string &key) {
 
             char c;
             int ret = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (ret == 0 || (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            if (ret >= 0 || (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                 close(fd);
                 fd = 0;
                 entry.total_counts--;

@@ -9,7 +9,7 @@
   │         Client            │              │              Server                  │
   │                           │              │                                      │
   │  CalcService_Stub         │              │  ┌────────────────────────────────┐  │
-  │    add() ──┐  async       │              │  │   MainReactor (RpcServer)      │  │
+  │    add() ──┐              │              │  │   MainReactor (RpcServer)      │  │
   │    sub() ──┤              │              │  │   listen / accept              │  │
   │            ▼              │              │  │   round-robin 分发 conn_fd     │  │
   │  RpcStub::call()          │              │  └─────┬──────┬──────┬───────────┘  │
@@ -87,7 +87,7 @@
 ### 客户端
 
 - **RpcStub 基类**：封装协议编码、服务发现、负载均衡、连接管理，业务 Stub 只需继承并实现具体方法
-- **同步调用**：每个 RPC 方法内部通过 `call()` 同步完成 send/recv，直接返回响应对象。早期版本使用 `std::async` 实现伪异步，压测发现每次调用创建/销毁线程的开销导致 QPS 下降约 78%，改为同步调用后性能提升 3.6 倍
+- **同步调用**：每个 RPC 方法内部通过 `call()` 同步完成 send/recv，直接返回响应对象。框架本身不管理并发——调用者通过多线程/协程等方式自行实现并发，每个调用者线程持有独立 Stub 实例，共享底层连接池。早期版本在框架层用 `std::async` 为每个请求创建线程，但由于调用者立即 `.get()` 阻塞等待，线程只服务一次请求就销毁（per-call 生命周期），并发度为零且线程创建/销毁开销极大，改为框架纯同步 + 调用者管理并发后性能提升 3.6 倍
 - **Round-Robin 负载均衡**：`atomic<int>` 索引 + `fetch_add` 无锁轮询，随机初始偏移避免多 Stub 实例集中访问同一 provider
 - **连接池 (RpcConnPool)**：
   - 按 `ip:port` 分组管理 TCP 连接，RAII 的 `ConnGuard` 自动归还
@@ -110,11 +110,15 @@
 - Ubuntu 22.04，客户端与服务端同机部署（loopback）
 - 测试方法：多线程并发调用 RPC，每线程持有独立 Stub 实例，通过连接池复用连接，固定运行 10 秒统计结果
 
-### 性能优化：移除 std::async 伪异步
+### 性能优化：从 per-call 线程到 per-worker 线程
 
-早期客户端使用 `std::async(launch::async)` 为每次 RPC 调用创建独立线程，通过 `std::future` 返回结果。压测发现 QPS 仅约 2,000，单次延迟高达 4,500μs。
+早期客户端在 `RpcStub::call()` 内部使用 `std::async(launch::async)` 为每次 RPC 调用创建独立线程执行 send/recv，通过 `std::future` 返回结果。这种设计的问题不在于"异步"本身，而在于**线程生命周期过短**：
 
-通过编写绕过客户端框架的 raw test（直接 socket connect/send/recv），确认服务端单次处理延迟仅约 300μs，定位到瓶颈在 `std::async` 每次调用创建/销毁线程的系统开销。移除伪异步改为同步调用后：
+- 调用者提交请求后立即 `.get()` 阻塞等待，线程间没有并发重叠
+- 每个线程只服务一次请求就销毁，50 个客户端线程每秒产生数千次线程生灭
+- 线程创建/销毁（分配栈、内核 task_struct、上下文切换）的系统开销远大于业务处理本身
+
+通过编写绕过客户端框架的 raw test（直接 socket connect/send/recv），确认服务端单次处理延迟仅约 300μs，定位到瓶颈在 per-call 线程创建/销毁。解决方案是将并发从框架层上移到调用者层：框架保持纯同步调用，调用者通过多线程自行管理并发，每个 worker 线程持有独立 Stub 实例，线程生命周期从 per-call 提升到 per-worker。改造后：
 
 | 指标 | 优化前（std::async） | 优化后（同步调用） | 变化 |
 |------|----------------------|---------------------|------|
@@ -173,7 +177,7 @@ TinyRPC/
 │   └── logger.cpp
 ├── example/                # 示例
 │   ├── server.cpp          # 服务端入口（守护进程 + 信号处理）
-│   └── client.cpp          # 客户端入口（异步调用示例）
+│   └── client.cpp          # 客户端入口（同步调用示例）
 ├── message.proto           # Protobuf 消息定义
 ├── Makefile
 └── build/                  # 编译输出
@@ -181,7 +185,7 @@ TinyRPC/
 
 ## 依赖
 
-- **C++23**
+- **C++20**
 - **Protocol Buffers** (libprotobuf)
 - **ZooKeeper C Client** (libzookeeper_mt)
 - **pthread**
